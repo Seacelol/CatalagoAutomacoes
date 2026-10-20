@@ -131,11 +131,11 @@ Arquivo JSON em UTF-8, legível e fácil de versionar ou auditar:
 ```json
 {
   "folders":   [{ "id": "...", "name": "CONTABIL", "parent_id": null }],
-  "items":     [{ "id": "...", "name": "LOGNET 01", "type": "Python",
-                  "companies": ["0335 LOGNET LOGISTICA E TRANSPORTES LTDA"],
+  "items":     [{ "id": "...", "name": "EMPRESA", "type": "Python",
+                  "companies": ["EMPRESA FICTICIA"],
                   "folder_id": "...", "location": "V:\\Codigos\\lognet.py",
                   "description": "...", "attachments": [] }],
-  "companies": ["0335 LOGNET LOGISTICA E TRANSPORTES LTDA"],
+  "companies": ["EMPRESA FICTICIA"],
   "history":   [{ "at": "19/10/2026 15:23:10", "user": "Marcelo",
                   "action": "editou", "kind": "automação", "changes": [] }]
 }
