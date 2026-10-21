@@ -20,7 +20,7 @@ call .venv-build\Scripts\activate.bat
 echo.
 echo [2/4] Instalando dependencias...
 python -m pip install --upgrade pip >nul
-pip install PySide6-Essentials pyinstaller pillow || goto erro
+pip install PySide6-Essentials openpyxl pyinstaller pillow || goto erro
 
 echo.
 echo [3/4] Gerando o executavel...
