@@ -9,7 +9,9 @@ Requisitos: pip install PySide6
 import getpass
 import html
 import json
+import csv
 import os
+import re
 import shutil
 import sys
 import time
@@ -17,11 +19,11 @@ import uuid
 from datetime import datetime
 from string import Template
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QRegularExpression, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence,
-                           QPalette, QShortcut, QTextOption)
+                           QPalette, QRegularExpressionValidator, QShortcut, QTextOption)
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QStyle, QTabBar, QTextBrowser,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -38,6 +40,31 @@ FIELD_LABELS = {"name": "Nome", "type": "Tipo", "companies": "Empresas", "folder
                 "location": "Local", "description": "Descrição"}
 HISTORY_LIMIT = 5000
 NO_COMPANY = "\x00sem-empresa"   # marcador interno para "automações sem empresa"
+CODE_RE = re.compile(r"[0-9]{4}")
+LABEL_RE = re.compile(r"^\s*([0-9]{1,4})(?:\s+(.*?))?\s*$")
+
+
+def norm_code(value):
+    """Converte 10, 10.0, '10', ' 0010 ' em '0010'. Levanta ValueError se não for um código de até 4 dígitos."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError
+        value = int(value)
+    text = str(value).strip()
+    if not re.fullmatch(r"[0-9]+", text) or int(text) > 9999:
+        raise ValueError
+    return str(int(text)).zfill(4)
+
+
+def split_label(text):
+    """'10 EMPRESA X' -> ('0010', 'EMPRESA X'); '10' -> ('0010', ''); sem código -> (None, texto)."""
+    text = " ".join(str(text).split())
+    m = LABEL_RE.match(text)
+    if m:
+        return m.group(1).zfill(4), (m.group(2) or "")
+    return None, text
 MAX_RECENT = 8
 ROLE_ID = Qt.UserRole
 ROLE_KIND = Qt.UserRole + 1
@@ -85,6 +112,9 @@ class Database:
         self.mtime = None
         if os.path.exists(self.path):
             self.load()
+            if self.migration_note:  # grava já convertida, para todos verem no formato novo
+                note = self.migration_note
+                self.mutate(lambda d: self._log(d, "converteu", "base", None, os.path.basename(self.path), note=note))
         else:
             self.mutate(lambda d: self._log(d, "criou", "base", None, os.path.basename(self.path)))
 
@@ -99,6 +129,7 @@ class Database:
             raise ValueError("O arquivo escolhido não é uma base do Catálogo de Automações.")
         data.setdefault("history", [])
         data.setdefault("companies", [])
+        self.migration_note = self._migrate(data)
         self.data = data
         self.mtime = os.path.getmtime(self.path)
 
@@ -172,7 +203,7 @@ class Database:
         if key == "folder_id":
             return self.folder_path(value or None)
         if key == "companies":
-            return ", ".join(value or [])
+            return self._labels(value)
         return value or ""
 
     def _snapshot(self, it, empty_side="old"):
@@ -229,127 +260,194 @@ class Database:
                     stack.append(f["id"])
         return ids
 
-    # empresas
-    def all_companies(self):
-        seen = {}
-        for c in self.data.get("companies", []):
-            seen.setdefault(c.lower(), c)
-        for i in self.data["items"]:
-            for c in i.get("companies") or []:
-                seen.setdefault(c.lower(), c)
-        return sorted(seen.values(), key=str.lower)
+    # empresas: cadastro {"code": "0001", "name": "..."}; as automações guardam só os códigos
+    @staticmethod
+    def _migrate(data):
+        """Converte empresas do formato antigo (texto "0001 NOME") para código + nome.
+        Devolve um resumo do que foi feito ou "" se a base já estava no formato novo."""
+        comps, items = data.get("companies", []), data["items"]
+        legacy = any(not isinstance(c, dict) for c in comps) or any(
+            not (isinstance(c, str) and CODE_RE.fullmatch(c)) for i in items for c in i.get("companies") or [])
+        if not legacy:
+            return ""
+        reg, by_text, raw = {}, {}, 0
 
-    def company_items(self, name):
-        """Automações de uma empresa; name=None devolve as sem empresa."""
-        if name is None:
+        def learn(entry):
+            if isinstance(entry, dict):
+                code, name = entry.get("code"), " ".join(str(entry.get("name", "")).split())
+                try:
+                    code = norm_code(code)
+                except ValueError:
+                    return None
+            else:
+                code, name = split_label(entry)
+                if code is None:
+                    return None
+            if not reg.get(code):  # mantém o primeiro nome não vazio
+                reg[code] = name
+            if name:
+                by_text.setdefault(name.lower(), code)
+            return code
+
+        for c in comps:
+            raw += 1
+            learn(c)
+        for i in items:
+            for c in i.get("companies") or []:
+                learn(c)
+        # textos sem código ganham um código livre, do 9999 para baixo
+        pending = []
+        for c in list(comps) + [c for i in items for c in i.get("companies") or []]:
+            if not isinstance(c, dict) and split_label(c)[0] is None:
+                key = " ".join(str(c).split()).lower()
+                if key and key not in by_text:
+                    by_text[key] = None
+                    pending.append(" ".join(str(c).split()))
+        free = (str(n).zfill(4) for n in range(9999, 0, -1) if str(n).zfill(4) not in reg)
+        provisional = []
+        for name in pending:
+            code = next(free)
+            reg[code] = name
+            by_text[name.lower()] = code
+            provisional.append(f"{code} {name}")
+
+        def code_of(entry):
+            if isinstance(entry, dict):
+                try:
+                    return norm_code(entry.get("code"))
+                except ValueError:
+                    return None
+            code, _ = split_label(entry)
+            return code or by_text.get(" ".join(str(entry).split()).lower())
+
+        for i in items:
+            codes = {code_of(c) for c in i.get("companies") or []}
+            i["companies"] = sorted(c for c in codes if c)
+        data["companies"] = [{"code": c, "name": reg[c]} for c in sorted(reg)]
+        note = f"Empresas convertidas para código + nome: {raw} registro(s) viraram {len(reg)} empresa(s)."
+        if raw > len(reg):
+            note += f" {raw - len(reg)} duplicata(s) com o mesmo código foram unificadas."
+        if provisional:
+            note += " Empresas sem código receberam código provisório: " + "; ".join(provisional) + "."
+        return note
+
+    def companies(self):
+        return sorted(self.data["companies"], key=lambda c: c["code"])
+
+    def company(self, code):
+        return next((c for c in self.data["companies"] if c["code"] == code), None)
+
+    def company_label(self, code):
+        c = self.company(code)
+        return f'{code} {c["name"]}'.strip() if c else code
+
+    def company_items(self, code):
+        """Automações de uma empresa; code=None devolve as sem empresa."""
+        if code is None:
             lst = [i for i in self.data["items"] if not i.get("companies")]
         else:
-            low = name.lower()
-            lst = [i for i in self.data["items"] if any(c.lower() == low for c in i.get("companies") or [])]
+            lst = [i for i in self.data["items"] if code in (i.get("companies") or [])]
         return sorted(lst, key=lambda i: i["name"].lower())
 
-    @staticmethod
-    def _dedupe(names):
-        uniq = {}
-        for c in names or []:
-            c = " ".join(str(c).split())
-            if c:
-                uniq.setdefault(c.lower(), c)
-        return sorted(uniq.values(), key=str.lower)
+    def _labels(self, codes):
+        return ", ".join(self.company_label(c) for c in codes or [])
 
-    def _canon(self, names):
-        known = {c.lower(): c for c in self.all_companies()}
-        return self._dedupe(known.get(" ".join(str(c).split()).lower(), c) for c in names or [])
-
-    @staticmethod
-    def _register(d, names):
-        reg = d.setdefault("companies", [])
-        low = {c.lower() for c in reg}
-        for c in names:
-            if c.lower() not in low:
-                reg.append(c)
-                low.add(c.lower())
+    def _register(self, d, pairs):
+        """Cadastra empresas novas vindas da tela de atribuição; ignora códigos já existentes."""
+        for code, name in pairs or []:
+            code, name = norm_code(code), " ".join(name.split())
+            if name and not self.company(code):
+                d["companies"].append({"code": code, "name": name})
+                self._log(d, "criou", "empresa", None, f"{code} {name}")
 
     def _set_companies(self, d, it, new):
         old = it.get("companies") or []
+        new = sorted(set(new))
         if old == new:
             return 0
         self._log(d, "editou", "automação", it["id"], it["name"], self.folder_path(it.get("folder_id")),
-                  [["Empresas", ", ".join(old), ", ".join(new)]])
+                  [["Empresas", self._labels(old), self._labels(new)]])
         it["companies"] = new
         it["updated_at"], it["updated_by"] = now(), current_user()
         return 1
 
-    def add_company(self, name):
-        name = " ".join(name.split())
+    def add_company(self, code, name):
+        code, name = norm_code(code), " ".join(name.split())
+        if not name:
+            raise ValueError("Informe o nome da empresa.")
 
         def op(d):
-            if any(c.lower() == name.lower() for c in self.all_companies()):
-                raise ValueError(f'A empresa "{name}" já existe.')
-            self._register(d, [name])
-            self._log(d, "criou", "empresa", None, name)
-            return name
+            if self.company(code):
+                raise ValueError(f'O código {code} já está cadastrado para "{self.company_label(code)}".')
+            d["companies"].append({"code": code, "name": name})
+            self._log(d, "criou", "empresa", None, f"{code} {name}")
+            return code
         return self.mutate(op)
 
-    def rename_company(self, old, new):
-        """Renomeia em todas as automações. Se o novo nome já existir, junta as duas.
-        Devolve (nome final, automações alteradas)."""
-        new = " ".join(new.split())
+    def edit_company(self, code, new_code, new_name):
+        """Altera código e/ou nome. Trocar o código atualiza todas as automações ligadas."""
+        new_code, new_name = norm_code(new_code), " ".join(new_name.split())
+        if not new_name:
+            raise ValueError("Informe o nome da empresa.")
 
         def op(d):
-            target = next((c for c in self.all_companies()
-                           if c.lower() == new.lower() and c.lower() != old.lower()), new)
-            d["companies"] = [c for c in d.get("companies", []) if c.lower() != old.lower()]
-            self._register(d, [target])
-            n = 0
-            for it in d["items"]:
-                comps = it.get("companies") or []
-                if any(c.lower() == old.lower() for c in comps):
-                    kept = [c for c in comps if c.lower() != old.lower()] + [target]
-                    n += self._set_companies(d, it, self._dedupe(kept))
-            self._log(d, "renomeou", "empresa", None, target, changes=[["Nome", old, target]])
-            return target, n
+            c = self.company(code)
+            if not c:
+                raise RuntimeError("Esta empresa foi excluída por outro usuário.")
+            if new_code != code and self.company(new_code):
+                raise ValueError(f'O código {new_code} já está cadastrado para "{self.company_label(new_code)}".')
+            changes = []
+            if new_code != code:
+                changes.append(["Código", code, new_code])
+            if new_name != c["name"]:
+                changes.append(["Nome", c["name"], new_name])
+            if not changes:
+                return code
+            c["code"], c["name"] = new_code, new_name
+            if new_code != code:
+                for it in d["items"]:
+                    if code in (it.get("companies") or []):
+                        it["companies"] = sorted(new_code if x == code else x for x in it["companies"])
+            self._log(d, "editou", "empresa", None, f"{new_code} {new_name}", changes=changes)
+            return new_code
         return self.mutate(op)
 
-    def remove_company(self, name):
+    def remove_company(self, code):
         def op(d):
-            d["companies"] = [c for c in d.get("companies", []) if c.lower() != name.lower()]
+            label = self.company_label(code)
             n = 0
             for it in d["items"]:
-                comps = it.get("companies") or []
-                if any(c.lower() == name.lower() for c in comps):
-                    n += self._set_companies(d, it, [c for c in comps if c.lower() != name.lower()])
-            self._log(d, "excluiu", "empresa", None, name,
+                if code in (it.get("companies") or []):
+                    n += self._set_companies(d, it, [x for x in it["companies"] if x != code])
+            d["companies"] = [c for c in d["companies"] if c["code"] != code]
+            self._log(d, "excluiu", "empresa", None, label,
                       note=f"Removida de {n} automação(ões). As automações não foram excluídas.")
             return n
         return self.mutate(op)
 
-    def set_item_companies(self, iid, names):
+    def set_item_companies(self, iid, codes, new_companies=None):
         def op(d):
             it = self.item(iid)
             if not it:
                 raise RuntimeError("Esta automação foi excluída por outro usuário.")
-            new = self._canon(names)
-            self._register(d, new)
-            return self._set_companies(d, it, new)
+            self._register(d, new_companies)
+            return self._set_companies(d, it, [c for c in codes if self.company(c)])
         return self.mutate(op)
 
-    def set_company_items(self, name, ids):
+    def set_company_items(self, code, ids):
         """Deixa a empresa ligada exatamente às automações de ids. Devolve quantas mudaram."""
         ids = set(ids)
 
         def op(d):
-            target = next((c for c in self.all_companies() if c.lower() == name.lower()), name)
-            self._register(d, [target])
+            if not self.company(code):
+                raise RuntimeError("Esta empresa foi excluída por outro usuário.")
             n = 0
             for it in d["items"]:
                 comps = it.get("companies") or []
-                has = any(c.lower() == target.lower() for c in comps)
-                want = it["id"] in ids
-                if has and not want:
-                    n += self._set_companies(d, it, [c for c in comps if c.lower() != target.lower()])
-                elif want and not has:
-                    n += self._set_companies(d, it, self._dedupe(comps + [target]))
+                if code in comps and it["id"] not in ids:
+                    n += self._set_companies(d, it, [c for c in comps if c != code])
+                elif code not in comps and it["id"] in ids:
+                    n += self._set_companies(d, it, comps + [code])
             return n
         return self.mutate(op)
 
@@ -407,10 +505,10 @@ class Database:
         for iid in self.mutate(op) or []:
             self._trash(iid)
 
-    def save_item(self, values, iid=None):
+    def save_item(self, values, iid=None, new_companies=None):
         def op(d):
-            values["companies"] = self._canon(values.get("companies"))
-            self._register(d, values["companies"])
+            self._register(d, new_companies)
+            values["companies"] = sorted({c for c in values.get("companies") or [] if self.company(c)})
             fid = values.get("folder_id")
             if fid and not self.folder(fid):
                 raise RuntimeError("A pasta escolhida foi excluída por outro usuário.")
@@ -692,64 +790,354 @@ def ask_base_startup():
 
 
 # --------------------------------------------------------------------------- diálogos
-class CompanyPicker(QWidget):
-    """Lista marcável de empresas com campo para filtrar ou cadastrar uma nova."""
+class CompanyDialog(QDialog):
+    """Cadastro ou edição de empresa: código de até 4 dígitos + nome."""
 
-    def __init__(self, known, selected):
+    def __init__(self, parent, code="", name=""):
+        super().__init__(parent)
+        self.setWindowTitle("Editar empresa" if code else "Nova empresa")
+        self.setMinimumWidth(480)
+        self.code = QLineEdit(code)
+        self.code.setValidator(QRegularExpressionValidator(QRegularExpression(r"[0-9]{0,4}")))
+        self.code.setPlaceholderText("Ex.: 10 vira 0010")
+        self.code.setMaximumWidth(140)
+        self.code.editingFinished.connect(self._pad)
+        self.name = QLineEdit(name)
+        self.name.setPlaceholderText("Razão social ou nome usado no escritório")
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.addRow("Código *", self.code)
+        form.addRow("Nome *", self.name)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("Salvar")
+        buttons.button(QDialogButtonBox.Save).setProperty("primary", True)
+        buttons.button(QDialogButtonBox.Cancel).setText("Cancelar")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 16)
+        lay.addLayout(form)
+        lay.addSpacing(8)
+        lay.addWidget(buttons)
+
+    def _pad(self):
+        if self.code.text().strip():
+            self.code.setText(norm_code(self.code.text()))
+
+    def _accept(self):
+        if not self.code.text().strip():
+            QMessageBox.warning(self, APP_NAME, "Informe o código da empresa.")
+            self.code.setFocus()
+            return
+        if not self.name.text().strip():
+            QMessageBox.warning(self, APP_NAME, "Informe o nome da empresa.")
+            self.name.setFocus()
+            return
+        self._pad()
+        self.accept()
+
+    def values(self):
+        return norm_code(self.code.text()), " ".join(self.name.text().split())
+
+
+class ImportCodesDialog(QDialog):
+    """Escolhe planilha, aba e coluna de onde ler os códigos das empresas."""
+
+    def __init__(self, parent, path):
+        super().__init__(parent)
+        self.path = path
+        self.setWindowTitle("Importar empresas de planilha")
+        self.setMinimumWidth(520)
+        self.wb = None
+        self.rows = []
+        self.sheet = QComboBox()
+        self.column = QComboBox()
+        self.header = QCheckBox("A primeira linha é cabeçalho")
+        self.replace = QCheckBox("Desmarcar as empresas já marcadas antes de importar")
+        self.preview = QLabel()
+        self.preview.setWordWrap(True)
+        self.preview.setObjectName("section")
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.addRow("Arquivo", QLabel(os.path.basename(path)))
+        form.addRow("Aba", self.sheet)
+        form.addRow("Coluna dos códigos", self.column)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Importar")
+        buttons.button(QDialogButtonBox.Ok).setProperty("primary", True)
+        buttons.button(QDialogButtonBox.Cancel).setText("Cancelar")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 16)
+        lay.addLayout(form)
+        lay.addWidget(self.header)
+        lay.addWidget(self.replace)
+        lay.addWidget(self.preview)
+        lay.addSpacing(8)
+        lay.addWidget(buttons)
+
+        self._open()
+        self.sheet.currentIndexChanged.connect(self._load_sheet)
+        self.column.currentIndexChanged.connect(self._guess_header)
+        self.header.toggled.connect(self._update_preview)
+        self._load_sheet()
+
+    def _open(self):
+        ext = os.path.splitext(self.path)[1].lower()
+        if ext == ".csv":
+            self.sheet.addItem("CSV")
+            return
+        if ext == ".xls":
+            raise RuntimeError("Arquivos .xls (Excel 97-2003) não são suportados. Abra no Excel e salve como .xlsx.")
+        try:
+            import openpyxl
+        except ImportError:
+            raise RuntimeError("O componente de leitura de Excel (openpyxl) não está instalado.\n"
+                               "Rode: pip install openpyxl")
+        self.wb = openpyxl.load_workbook(self.path, read_only=True, data_only=True)
+        self.sheet.addItems(self.wb.sheetnames)
+
+    def _read_csv(self):
+        for enc in ("utf-8-sig", "cp1252"):
+            try:
+                with open(self.path, newline="", encoding=enc) as f:
+                    text = f.read()
+                break
+            except UnicodeDecodeError:
+                continue
+        try:
+            dialect = csv.Sniffer().sniff(text[:4096], delimiters=";,\t|")
+        except csv.Error:
+            dialect = csv.excel
+            dialect.delimiter = ";"
+        return [list(r) for r in csv.reader(text.splitlines(), dialect)]
+
+    def _load_sheet(self, *_):
+        if self.wb is None:
+            self.rows = self._read_csv()
+        else:
+            ws = self.wb[self.sheet.currentText()]
+            self.rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        while self.rows and all(v in (None, "") for v in self.rows[-1]):
+            self.rows.pop()
+        ncols = max((len(r) for r in self.rows), default=0)
+        first = self.rows[0] if self.rows else []
+        self.column.blockSignals(True)
+        self.column.clear()
+        best, best_score = 0, -1
+        for c in range(ncols):
+            letter = self._letter(c)
+            head = first[c] if c < len(first) else None
+            self.column.addItem(f"{letter}  ({head})" if head not in (None, "") else letter, c)
+            score = sum(1 for r in self.rows[:200] if c < len(r) and self._code(r[c]))
+            if head and "cod" in str(head).lower():
+                score += 1000
+            if score > best_score:
+                best, best_score = c, score
+        self.column.setCurrentIndex(best)
+        self.column.blockSignals(False)
+        self._guess_header()
+
+    @staticmethod
+    def _letter(i):
+        s = ""
+        i += 1
+        while i:
+            i, r = divmod(i - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
+    @staticmethod
+    def _code(value):
+        """Código de um valor de célula: número, '10', '0010' ou '0010 NOME DA EMPRESA'."""
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                return norm_code(value)
+            except ValueError:
+                return None
+        code, _ = split_label(value)
+        return code
+
+    def _guess_header(self, *_):
+        c = self.column.currentData()
+        first = self.rows[0] if self.rows else []
+        is_head = c is not None and c < len(first) and first[c] not in (None, "") and not self._code(first[c])
+        self.header.blockSignals(True)
+        self.header.setChecked(is_head)
+        self.header.blockSignals(False)
+        self._update_preview()
+
+    def _values(self):
+        c = self.column.currentData()
+        if c is None:
+            return []
+        rows = self.rows[1:] if self.header.isChecked() else self.rows
+        return [r[c] for r in rows if c < len(r) and r[c] not in (None, "")]
+
+    def _update_preview(self, *_):
+        vals = self._values()
+        ok = sum(1 for v in vals if self._code(v))
+        self.preview.setText(f"{len(vals)} célula(s) preenchida(s) na coluna, {ok} com código válido.")
+
+    def result_codes(self):
+        """(códigos válidos sem repetição, valores que não são código)."""
+        codes, invalid = [], []
+        for v in self._values():
+            code = self._code(v)
+            if code:
+                if code not in codes:
+                    codes.append(code)
+            else:
+                invalid.append(str(v))
+        return codes, invalid
+
+    def done(self, r):
+        if self.wb is not None:
+            self.wb.close()
+        super().done(r)
+
+
+class CompanyPicker(QWidget):
+    """Lista marcável de empresas (código + nome) com filtro, cadastro rápido e importação de planilha."""
+
+    def __init__(self, db, selected, list_height=130):
         super().__init__()
+        self.db = db
+        self.pending = {}  # empresas novas digitadas aqui: código -> nome
         self.edit = QLineEdit()
-        self.edit.setPlaceholderText("Filtrar ou digitar nova empresa e Enter...")
+        self.edit.setPlaceholderText("Filtrar, ou digitar \"código nome\" e Enter para cadastrar")
         self.edit.textChanged.connect(self._filter)
         self.edit.returnPressed.connect(self.add)
         btn = QPushButton("Adicionar")
         btn.clicked.connect(self.add)
+        self.btn_import = QPushButton("Importar do Excel...")
+        self.btn_import.clicked.connect(self.import_file)
         self.list = QListWidget()
-        self.list.setFixedHeight(130)
-        names = {c.lower(): c for c in known}
-        names.update({c.lower(): c for c in selected})
-        chosen = {c.lower() for c in selected}
-        for c in sorted(names.values(), key=str.lower):
-            self._insert(c, c.lower() in chosen)
+        self.list.setFixedHeight(list_height)
+        chosen = set(selected or [])
+        self.list.setUniformItemSizes(True)
+        for c in db.companies():
+            self._insert(c["code"], c["name"], c["code"] in chosen)
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(self.edit, 1)
         row.addWidget(btn)
+        row.addWidget(self.btn_import)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
         lay.addLayout(row)
         lay.addWidget(self.list)
 
-    def _insert(self, name, checked):
-        it = QListWidgetItem(name)
+    def _insert(self, code, name, checked):
+        it = QListWidgetItem(f"{code}  {name}")
+        it.setData(ROLE_ID, code)
         it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
         it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         self.list.addItem(it)
         return it
 
-    def _filter(self, text):
-        t = text.strip().lower()
+    def _find(self, code):
         for i in range(self.list.count()):
-            self.list.item(i).setHidden(bool(t) and t not in self.list.item(i).text().lower())
+            if self.list.item(i).data(ROLE_ID) == code:
+                return self.list.item(i)
+        return None
+
+    def _filter(self, text):
+        t = " ".join(text.split()).lower()
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            item.setHidden(bool(t) and t not in " ".join(item.text().split()).lower())
 
     def add(self):
-        name = " ".join(self.edit.text().split())
-        if not name:
+        text = " ".join(self.edit.text().split())
+        if not text:
             return
-        for i in range(self.list.count()):
-            if self.list.item(i).text().lower() == name.lower():
-                it = self.list.item(i)
-                break
+        code, name = split_label(text)
+        if code is None:
+            visible = [self.list.item(i) for i in range(self.list.count()) if not self.list.item(i).isHidden()]
+            if len(visible) == 1:
+                item = visible[0]
+            else:
+                QMessageBox.information(self, APP_NAME, "Para cadastrar uma empresa nova, digite o código e o nome, "
+                                        "por exemplo: 10 EMPRESA EXEMPLO LTDA.\n\n"
+                                        "Para marcar uma existente, filtre até sobrar só ela e aperte Enter.")
+                return
         else:
-            it = self._insert(name, True)
-            self.list.sortItems()
-        it.setCheckState(Qt.Checked)
+            item = self._find(code)
+            if item is None:
+                if not name:
+                    QMessageBox.information(self, APP_NAME, f"O código {code} não está cadastrado.\n\n"
+                                            "Digite o código e o nome para cadastrar, por exemplo: "
+                                            f"{int(code)} EMPRESA EXEMPLO LTDA.")
+                    return
+                self.pending[code] = name
+                item = self._insert(code, name, True)
+                self.list.sortItems()
+        item.setCheckState(Qt.Checked)
         self.edit.clear()
-        self.list.scrollToItem(it)
+        self.list.scrollToItem(item)
+
+    def mark_codes(self, codes, replace=False):
+        """Marca os códigos informados. Devolve (marcados, não cadastrados)."""
+        if replace:
+            for i in range(self.list.count()):
+                self.list.item(i).setCheckState(Qt.Unchecked)
+        found, missing = [], []
+        for code in codes:
+            item = self._find(code)
+            if item:
+                item.setCheckState(Qt.Checked)
+                found.append(code)
+            else:
+                missing.append(code)
+        return found, missing
+
+    def import_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Importar códigos de empresas", "",
+                                              "Planilhas (*.xlsx *.xlsm *.csv);;Todos os arquivos (*.*)")
+        if not path:
+            return
+        try:
+            dlg = ImportCodesDialog(self, path)
+        except Exception as ex:
+            QMessageBox.warning(self, APP_NAME, f"Não foi possível abrir a planilha:\n{ex}")
+            return
+        if not dlg.exec():
+            return
+        codes, invalid = dlg.result_codes()
+        found, missing = self.mark_codes(codes, dlg.replace.isChecked())
+        box = QMessageBox(self)
+        box.setWindowTitle("Importação da planilha")
+        box.setIcon(QMessageBox.Warning if missing or invalid else QMessageBox.Information)
+        msg = f"{len(found)} empresa(s) marcada(s) a partir da planilha."
+        if missing:
+            msg += f"\n\n{len(missing)} código(s) não estão cadastrados: " + ", ".join(missing[:30])
+            if len(missing) > 30:
+                msg += f" e mais {len(missing) - 30}"
+        if invalid:
+            msg += f"\n\n{len(invalid)} valor(es) da coluna não são códigos válidos e foram ignorados."
+        msg += "\n\nRevise a lista e clique em Salvar para gravar."
+        box.setText(msg)
+        details = []
+        if missing:
+            details.append("Códigos não cadastrados:\n" + "\n".join(missing))
+        if invalid:
+            details.append("Valores ignorados:\n" + "\n".join(invalid))
+        if details:
+            box.setDetailedText("\n\n".join(details))
+        box.exec()
 
     def selected(self):
-        return sorted((self.list.item(i).text() for i in range(self.list.count())
-                       if self.list.item(i).checkState() == Qt.Checked), key=str.lower)
+        return sorted(self.list.item(i).data(ROLE_ID) for i in range(self.list.count())
+                      if self.list.item(i).checkState() == Qt.Checked)
+
+    def new_companies(self):
+        sel = set(self.selected())
+        return [(c, n) for c, n in self.pending.items() if c in sel]
 
 
 class ItemDialog(QDialog):
@@ -773,7 +1161,7 @@ class ItemDialog(QDialog):
         self.folder.setCurrentIndex(max(self.folder.findData(target), 0))
         self.location = QLineEdit(item.get("location", ""))
         self.location.setPlaceholderText(r"Ex.: \\servidor\automacoes\financeiro\conciliacao.py")
-        self.companies = CompanyPicker(db.all_companies(), item.get("companies") or companies or [])
+        self.companies = CompanyPicker(db, item.get("companies") or companies or [])
         self.desc = QPlainTextEdit(item.get("description", ""))
         self.desc.setPlaceholderText("O que ela faz, quando roda, de onde lê e onde grava, quem é o responsável...")
         self.desc.setMinimumHeight(140)
@@ -815,6 +1203,7 @@ class ItemDialog(QDialog):
             "name": self.name.text().strip(),
             "type": self.type.currentText().strip(),
             "companies": self.companies.selected(),
+            "new_companies": self.companies.new_companies(),
             "folder_id": self.folder.currentData() or None,
             "location": self.location.text().strip(),
             "description": self.desc.toPlainText().strip(),
@@ -824,7 +1213,7 @@ class ItemDialog(QDialog):
 class HistoryDialog(QDialog):
     ACTIONS = [("Todas as ações", None), ("Criações", ("criou",)), ("Edições", ("editou",)),
                ("Renomeações", ("renomeou",)), ("Exclusões", ("excluiu",)), ("Anexos", ("anexou", "desanexou"))]
-    LABELS = {"anexou": "Anexou arquivo", "desanexou": "Removeu anexo"}
+    LABELS = {"anexou": "Anexou arquivo", "desanexou": "Removeu anexo", "converteu": "Converteu empresas"}
 
     def __init__(self, parent, db, theme, target_id=None, target_name=None):
         super().__init__(parent)
@@ -943,11 +1332,12 @@ class AssignCompaniesDialog(QDialog):
     def __init__(self, parent, db, item):
         super().__init__(parent)
         self.setWindowTitle(f'Atribuir empresas: {item["name"]}')
-        self.resize(460, 520)
-        info = QLabel("Marque as empresas que usam esta automação. Para cadastrar uma nova, digite o nome e aperte Enter.")
+        self.resize(620, 600)
+        info = QLabel("Marque as empresas que usam esta automação, ou use \"Importar do Excel\" para marcar "
+                      "pelos códigos de uma planilha. Para cadastrar uma nova, digite \"código nome\" e aperte Enter.")
         info.setWordWrap(True)
-        self.picker = CompanyPicker(db.all_companies(), item.get("companies") or [])
-        self.picker.list.setMinimumHeight(300)
+        self.picker = CompanyPicker(db, item.get("companies") or [])
+        self.picker.list.setMinimumHeight(360)
         self.picker.list.setMaximumHeight(16777215)
         self.count = QLabel()
         self.count.setMinimumWidth(130)
@@ -982,6 +1372,9 @@ class AssignCompaniesDialog(QDialog):
     def selected(self):
         return self.picker.selected()
 
+    def new_companies(self):
+        return self.picker.new_companies()
+
 
 class AssignItemsDialog(QDialog):
     """Marca ou desmarca as automações ligadas a uma empresa, organizadas pelas pastas."""
@@ -989,9 +1382,10 @@ class AssignItemsDialog(QDialog):
     def __init__(self, parent, db, company):
         super().__init__(parent)
         self.db = db
-        self.setWindowTitle(f"Atribuir automações: {company}")
+        label = db.company_label(company)
+        self.setWindowTitle(f"Atribuir automações: {label}")
         self.resize(640, 620)
-        info = QLabel(f'Marque as automações usadas por "{company}". Marcar uma pasta marca tudo dentro dela.')
+        info = QLabel(f'Marque as automações usadas por "{label}". Marcar uma pasta marca tudo dentro dela.')
         info.setWordWrap(True)
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Filtrar automações...")
@@ -1396,10 +1790,10 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- montagem
     def _real_company(self, name):
-        """Nome canônico da empresa ou None se ela não existe mais."""
+        """Código da empresa se ela ainda existe, senão None."""
         if name == NO_COMPANY:
             return NO_COMPANY
-        return next((c for c in self.db.all_companies() if c.lower() == (name or "").lower()), None)
+        return name if name and self.db.company(name) else None
 
     def refresh(self):
         if self.current and not self.db.folder(self.current):
@@ -1471,10 +1865,14 @@ class MainWindow(QMainWindow):
         croot = node("Empresas", "companies", "", self.style().standardIcon(QStyle.SP_DirHomeIcon))
         self.tree.addTopLevelItem(croot)
         to_select = croot
-        for c in self.db.all_companies():
-            n = node(f"{c}  ({len(self.db.company_items(c))})", "company", c, self.icon_folder)
+        counts = {}
+        for i in self.db.data["items"]:
+            for code in i.get("companies") or []:
+                counts[code] = counts.get(code, 0) + 1
+        for c in self.db.companies():
+            n = node(f'{c["code"]}  {c["name"]}  ({counts.get(c["code"], 0)})', "company", c["code"], self.icon_folder)
             croot.addChild(n)
-            if self.company == c:
+            if self.company == c["code"]:
                 to_select = n
         n_none = len(self.db.company_items(None))
         if n_none:
@@ -1500,7 +1898,7 @@ class MainWindow(QMainWindow):
             folders = [f for f in self.db.data["folders"] if q in f["name"].lower()]
             items = [i for i in self.db.data["items"] if q in " ".join([
                 i.get("name", ""), i.get("type", ""), i.get("location", ""),
-                i.get("description", ""), " ".join(i.get("companies") or []),
+                i.get("description", ""), self.db._labels(i.get("companies")),
                 " ".join(a["file"] for a in i.get("attachments") or []), self.db.folder_path(i.get("folder_id"))]).lower()]
             folders.sort(key=lambda f: f["name"].lower())
             items.sort(key=lambda i: i["name"].lower())
@@ -1511,7 +1909,11 @@ class MainWindow(QMainWindow):
                 self.listw.setColumnHidden(4, False)
             else:
                 items = []
-                companies = [(c, len(self.db.company_items(c))) for c in self.db.all_companies()]
+                counts = {}
+                for i in self.db.data["items"]:
+                    for code in i.get("companies") or []:
+                        counts[code] = counts.get(code, 0) + 1
+                companies = [(c["code"], counts.get(c["code"], 0)) for c in self.db.companies()]
                 n_none = len(self.db.company_items(None))
                 if n_none:
                     companies.append((NO_COMPANY, n_none))
@@ -1521,7 +1923,7 @@ class MainWindow(QMainWindow):
 
         to_select = None
         for c, n in companies:
-            row = QTreeWidgetItem(["Sem empresa" if c == NO_COMPANY else c, "Empresa",
+            row = QTreeWidgetItem(["Sem empresa" if c == NO_COMPANY else self.db.company_label(c), "Empresa",
                                    f"{n} automação(ões)", "", "", ""])
             row.setIcon(0, self.icon_folder)
             row.setData(0, ROLE_ID, c)
@@ -1542,11 +1944,12 @@ class MainWindow(QMainWindow):
             if self.selected == ("folder", f["id"]):
                 to_select = row
         for i in items:
-            comp = ", ".join(i.get("companies") or [])
+            codes = i.get("companies") or []
+            comp = self.db.company_label(codes[0]) if len(codes) == 1 else ", ".join(codes)
             row = QTreeWidgetItem([i["name"], i.get("type", ""), comp, i.get("location", ""),
                                    self.db.folder_path(i.get("folder_id")), i.get("updated_at", "")])
             row.setIcon(0, self.icon_item)
-            row.setToolTip(2, comp)
+            row.setToolTip(2, "\n".join(self.db.company_label(c) for c in codes))
             row.setToolTip(3, i.get("location", ""))
             n_att = len(i.get("attachments") or [])
             if n_att:
@@ -1583,7 +1986,7 @@ class MainWindow(QMainWindow):
             self.crumb.setText(f"Resultados da busca: {len(folders) + len(items)}")
             self.btn_up.setEnabled(False)
         elif self.mode == "companies":
-            name = "Sem empresa" if self.company == NO_COMPANY else self.company
+            name = "Sem empresa" if self.company == NO_COMPANY else self.db.company_label(self.company)
             self.crumb.setText(f"Empresas / {name}" if self.company else "Empresas")
             self.btn_up.setEnabled(bool(self.company))
         else:
@@ -1611,7 +2014,7 @@ class MainWindow(QMainWindow):
             self.btn_copy.setVisible(False)
             self.att_box.setVisible(False)
             if kind == "companies":
-                comps = self.db.all_companies()
+                comps = self.db.companies()
                 n_none = len(self.db.company_items(None))
                 self.details.setHtml(f"""
                     <div style='font-size:15pt;font-weight:700'>Empresas</div>
@@ -1629,7 +2032,7 @@ class MainWindow(QMainWindow):
             for i in items:
                 types[i.get("type") or "Sem tipo"] = types.get(i.get("type") or "Sem tipo", 0) + 1
             tline = ", ".join(f"{e(k)} ({v})" for k, v in sorted(types.items(), key=lambda kv: -kv[1]))
-            title = "Sem empresa vinculada" if oid == NO_COMPANY else oid
+            title = "Sem empresa vinculada" if oid == NO_COMPANY else self.db.company_label(oid)
             self.details.setHtml(f"""
                 <div style='font-size:15pt;font-weight:700'>{e(title)}</div>
                 <p style='{label}'>AUTOMAÇÕES ({len(items)})</p><table cellspacing='0'>{rows}</table>
@@ -1651,8 +2054,9 @@ class MainWindow(QMainWindow):
                    f"Atualizado por {e(it.get('updated_by', '?'))} em {e(it.get('updated_at', '?'))}"
             n_hist = sum(1 for h in self.db.data.get("history", []) if h.get("target_id") == oid)
             badge = f"background:{t['hover']};color:{t['text']}"
-            comps = "&nbsp; ".join(f"<a href='empresa:{e(c)}' style='text-decoration:none;{badge}'>&nbsp;{e(c)}&nbsp;</a>"
-                                   for c in it.get("companies") or []) or f"{empty}Nenhuma empresa</i>"
+            comps = "<br>".join(f"<a href='empresa:{e(c)}' style='text-decoration:none;{badge}'>&nbsp;"
+                                f"{e(self.db.company_label(c))}&nbsp;</a>"
+                                for c in it.get("companies") or []) or f"{empty}Nenhuma empresa</i>"
             self._fill_attachments(it)
             self.details.setHtml(f"""
                 <div style='font-size:15pt;font-weight:700'>{e(it['name'])}</div>
@@ -1774,7 +2178,7 @@ class MainWindow(QMainWindow):
                 m.addSeparator()
                 m.addAction("Atribuir automações...", lambda: self.assign_items(fid))
                 m.addAction("Nova automação para esta empresa", self.new_item)
-                m.addAction("Renomear", lambda: self.rename_company(fid))
+                m.addAction("Editar empresa", lambda: self.rename_company(fid))
                 m.addAction("Histórico", lambda: self.company_history(fid))
                 m.addAction("Excluir empresa", lambda: self.delete_company(fid))
             m.exec(self.tree.viewport().mapToGlobal(pos))
@@ -1797,7 +2201,7 @@ class MainWindow(QMainWindow):
                 m.addAction("Abrir", lambda: self.open_companies(oid))
                 if oid != NO_COMPANY:
                     m.addAction("Atribuir automações...", lambda: self.assign_items(oid))
-                    m.addAction("Renomear", lambda: self.rename_company(oid))
+                    m.addAction("Editar empresa", lambda: self.rename_company(oid))
                     m.addSeparator()
                     m.addAction("Excluir empresa", lambda: self.delete_company(oid))
                 m.exec(self.listw.viewport().mapToGlobal(pos))
@@ -1810,7 +2214,8 @@ class MainWindow(QMainWindow):
                 m.addAction("Atribuir empresas...", lambda: self.assign_companies(oid))
                 if self.mode == "companies" and self.company and self.company != NO_COMPANY \
                         and not self.search.text().strip():
-                    m.addAction(f'Remover de "{self.company}"', lambda: self.unlink(oid, self.company))
+                    m.addAction(f'Remover de "{self.db.company_label(self.company)}"',
+                                lambda: self.unlink(oid, self.company))
                 m.addAction("Anexar arquivos...", lambda: self.attach_files())
                 loc = (self.db.item(oid) or {}).get("location")
                 if loc:
@@ -1877,7 +2282,8 @@ class MainWindow(QMainWindow):
         dlg = ItemDialog(self, self.db, folder_id=self.current, companies=[self.company] if in_company else None)
         if dlg.exec():
             vals = dlg.values()
-            iid = self._run(lambda: self.db.save_item(vals))
+            new = vals.pop("new_companies", [])
+            iid = self._run(lambda: self.db.save_item(vals, new_companies=new))
             if iid:
                 if self.mode == "folders":
                     self.open_folder(vals["folder_id"])
@@ -1891,7 +2297,8 @@ class MainWindow(QMainWindow):
         dlg = ItemDialog(self, self.db, item=it)
         if dlg.exec():
             vals = dlg.values()
-            self._run(lambda: self.db.save_item(vals, iid))
+            new = vals.pop("new_companies", [])
+            self._run(lambda: self.db.save_item(vals, iid, new_companies=new))
 
     def delete_item(self, iid):
         it = self.db.item(iid)
@@ -1936,45 +2343,51 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- empresas
     def new_company(self):
-        name, ok = QInputDialog.getText(self, "Nova empresa", "Nome da empresa:")
-        name = " ".join(name.split())
-        if ok and name:
-            if self._run(lambda: self.db.add_company(name)):
-                if self.mode != "companies":
-                    self.open_companies()
-                self.selected = ("company", name) if not self.company else self.selected
-                self.refresh()
-
-    def rename_company(self, name):
-        new, ok = QInputDialog.getText(self, "Renomear empresa",
-                                       f'Novo nome para "{name}" (vale para todas as automações):', text=name)
-        new = " ".join(new.split())
-        if not ok or not new or new == name:
+        dlg = CompanyDialog(self)
+        if not dlg.exec():
             return
-        other = next((c for c in self.db.all_companies() if c.lower() == new.lower() and c.lower() != name.lower()), None)
-        if other and QMessageBox.question(
-                self, APP_NAME, f'Já existe a empresa "{other}". Juntar "{name}" com ela?') != QMessageBox.Yes:
-            return
-        res = self._run(lambda: self.db.rename_company(name, new))
-        if res:
-            if self.company == name:
-                self.company = res[0]
-            if self.selected == ("company", name):
-                self.selected = ("company", res[0])
+        code, name = dlg.values()
+        if self._run(lambda: self.db.add_company(code, name)):
+            if self.mode != "companies":
+                self.open_companies()
+            if not self.company:
+                self.selected = ("company", code)
             self.refresh()
-            self.statusBar().showMessage(f"Empresa renomeada em {res[1]} automação(ões).", 4000)
 
-    def delete_company(self, name):
-        n = len(self.db.company_items(name))
-        msg = f'Excluir a empresa "{name}"?'
+    def rename_company(self, code):
+        c = self.db.company(code)
+        if not c:
+            return
+        dlg = CompanyDialog(self, c["code"], c["name"])
+        if not dlg.exec():
+            return
+        new_code, new_name = dlg.values()
+        if new_code != code:
+            n = len(self.db.company_items(code))
+            if n and QMessageBox.question(
+                    self, APP_NAME, f"Trocar o código de {code} para {new_code}?\n\n"
+                    f"As {n} automação(ões) ligadas passam a usar o código novo.") != QMessageBox.Yes:
+                return
+        res = self._run(lambda: self.db.edit_company(code, new_code, new_name))
+        if res:
+            if self.company == code:
+                self.company = res
+            if self.selected == ("company", code):
+                self.selected = ("company", res)
+            self.refresh()
+            self.statusBar().showMessage("Empresa atualizada.", 3000)
+
+    def delete_company(self, code):
+        n = len(self.db.company_items(code))
+        msg = f'Excluir a empresa "{self.db.company_label(code)}"?'
         if n:
             msg += f"\n\nEla será retirada de {n} automação(ões). As automações não são excluídas."
         if QMessageBox.question(self, APP_NAME, msg) != QMessageBox.Yes:
             return
-        if self.company == name:
+        if self.company == code:
             self.company = None
         self.selected = None
-        self._run(lambda: self.db.remove_company(name))
+        self._run(lambda: self.db.remove_company(code))
 
     def assign_companies(self, iid):
         it = self.db.item(iid)
@@ -1982,32 +2395,32 @@ class MainWindow(QMainWindow):
             return
         dlg = AssignCompaniesDialog(self, self.db, it)
         if dlg.exec():
-            names = dlg.selected()
-            if self._run(lambda: self.db.set_item_companies(iid, names)) is not None:
+            codes, new = dlg.selected(), dlg.new_companies()
+            if self._run(lambda: self.db.set_item_companies(iid, codes, new)) is not None:
                 self.statusBar().showMessage("Empresas atualizadas.", 3000)
 
-    def assign_items(self, name):
+    def assign_items(self, code):
         if not self.db.data["items"]:
             QMessageBox.information(self, APP_NAME, "Ainda não há automações cadastradas.")
             return
-        dlg = AssignItemsDialog(self, self.db, name)
+        dlg = AssignItemsDialog(self, self.db, code)
         if dlg.exec():
             ids = dlg.selected()
-            n = self._run(lambda: self.db.set_company_items(name, ids))
+            n = self._run(lambda: self.db.set_company_items(code, ids))
             if n is not None:
-                self.statusBar().showMessage(f"{n} automação(ões) alterada(s) em {name}.", 4000)
+                self.statusBar().showMessage(f"{n} automação(ões) alterada(s) em {self.db.company_label(code)}.", 4000)
 
-    def unlink(self, iid, name):
+    def unlink(self, iid, code):
         it = self.db.item(iid)
         if it:
-            rest = [c for c in it.get("companies") or [] if c.lower() != name.lower()]
+            rest = [c for c in it.get("companies") or [] if c != code]
             self.selected = None
             self._run(lambda: self.db.set_item_companies(iid, rest))
 
-    def company_history(self, name):
+    def company_history(self, code):
         dlg = HistoryDialog(self, self.db, self.t, None, None)
-        dlg.setWindowTitle(f"Histórico: {name}")
-        dlg.search.setText(name)
+        dlg.setWindowTitle(f"Histórico: {self.db.company_label(code)}")
+        dlg.search.setText(code)
         dlg.exec()
 
     def show_history(self, oid=None):

@@ -16,10 +16,12 @@ Feito em Python com PySide6 (Qt 6). A base é um arquivo JSON numa pasta de rede
 - Botão para copiar o local da automação
 
 **Empresas**
+- Cadastro com código de 4 dígitos e nome, exibidos juntos (`0001 ALVES & MELLO ASSESSORIA CONTABIL`). Códigos com menos dígitos são completados com zeros: 10 vira 0010
+- O código é único e é ele que liga a empresa às automações, então trocar o nome ou o código atualiza tudo de uma vez
 - Aba própria em que cada empresa funciona como uma pasta com as automações ligadas a ela
-- "Atribuir empresas" numa automação: marca e desmarca empresas numa lista
+- "Atribuir empresas" numa automação: marca e desmarca empresas numa lista, ou cadastra uma nova digitando `código nome`
+- Importação de planilha na mesma tela: escolha o arquivo (.xlsx, .xlsm ou .csv), a aba e a coluna dos códigos, e as empresas são marcadas automaticamente. Os códigos que não estão cadastrados aparecem numa lista ao final
 - "Atribuir automações" numa empresa: marca e desmarca automações organizadas pelas pastas dos setores
-- Renomear empresa em todas as automações de uma vez, juntando duplicatas se o nome já existir
 - Pasta "Sem empresa" para achar automações que ainda não têm empresa vinculada
 
 **Anexos**
@@ -50,9 +52,11 @@ Feito em Python com PySide6 (Qt 6). A base é um arquivo JSON numa pasta de rede
 ## Como rodar pelo código
 
 ```bash
-pip install PySide6
+pip install PySide6 openpyxl
 python catalogo_automacoes.py
 ```
+
+O `openpyxl` só é usado na importação de planilhas. Sem ele o app funciona normalmente e avisa quando alguém tentar importar.
 
 Na primeira execução o app pergunta onde fica a base: abra uma existente ou crie uma nova na pasta de rede.
 
@@ -131,17 +135,20 @@ Arquivo JSON em UTF-8, legível e fácil de versionar ou auditar:
 ```json
 {
   "folders":   [{ "id": "...", "name": "CONTABIL", "parent_id": null }],
-  "items":     [{ "id": "...", "name": "EMPRESA", "type": "Python",
-                  "companies": ["EMPRESA FICTICIA"],
-                  "folder_id": "...", "location": "V:\\Codigos\\lognet.py",
+  "items":     [{ "id": "...", "name": "CONCILIACAO 01", "type": "Python",
+                  "companies": ["0001", "0010"],
+                  "folder_id": "...", "location": "\\\\servidor\\codigos\\conciliacao.py",
                   "description": "...", "attachments": [] }],
-  "companies": ["EMPRESA FICTICIA"],
-  "history":   [{ "at": "19/10/2026 15:23:10", "user": "Marcelo",
+  "companies": [{ "code": "0001", "name": "EMPRESA EXEMPLO LTDA" },
+                { "code": "0010", "name": "OUTRA EMPRESA SA" }],
+  "history":   [{ "at": "19/10/2026 15:23:10", "user": "usuario",
                   "action": "editou", "kind": "automação", "changes": [] }]
 }
 ```
 
-O histórico guarda os 5.000 registros mais recentes.
+As automações guardam só os códigos das empresas; o nome vem do cadastro. O histórico guarda os 5.000 registros mais recentes.
+
+Bases de versões anteriores, em que a empresa era um texto único como `0001 NOME`, são convertidas sozinhas na primeira abertura: o código é separado do nome, espaços repetidos são removidos e entradas com o mesmo código viram uma só. A conversão fica registrada no histórico.
 
 ## Limitações
 
